@@ -185,7 +185,23 @@ static esp_err_t compute_one_frame(const float *samples, float *log_mel_out)
     for (int k = 0; k < FFT_BINS; ++k) {
         float re = s_fft_work[2 * k];
         float im = s_fft_work[2 * k + 1];
-        magnitude[k] = sqrtf(re * re + im * im);
+        /* FIXED (false-vibration): FFT-normalise the magnitude.
+         * The unnormalised magnitude (peaks ~100 for a loud tone) pushes
+         * log-mel peaks to ~+4.5, far above the distribution this INT8
+         * model was PTQ-calibrated on (synthetic Gaussian patches,
+         * mean -5, std 3 -- see the model card). Internal activations
+         * saturate, ~dozens of unrelated classes pin at ~0.65-0.75, and
+         * ANY sound (silence included: emergency max was 0.672 on a
+         * constant -6.9 patch) crosses the old 0.60 threshold.
+         * Host A/B with this exact mel code + the repo model:
+         * unnormalised, a synthetic siren's top-3 was Fireworks / Bass
+         * guitar / Biting; with 1/FFT_SIZE scaling the same siren's
+         * top-3 is Siren / Fire-engine siren / Car alarm, and music /
+         * noise / silence stop masquerading as alerts.
+         * VALIDATE ON DEVICE with real sounds before trusting it:
+         * play a real siren + fire alarm + baby cry and negatives
+         * (TV, music, speech, kettle) and compare DECISION logs. */
+        magnitude[k] = sqrtf(re * re + im * im) / (float)MEL_FFT_SIZE;
     }
 
     float mel_energy[MEL_BANDS] = {0};
