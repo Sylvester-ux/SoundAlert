@@ -1,0 +1,11 @@
+**/build/
+**/managed_components/
+**/.venv/
+**/sdkconfig.old
+/backups/
+*.before_*
+*.repair_backup
+*.inference_pass
+*.inference_working_*
+*.mic_before_*
+*.mic_working_*
