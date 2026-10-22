@@ -1,3 +1,7 @@
+// CUSTOM-MODEL VARIANT: built for soundalert.tflite (SoundAlertNet,
+// 4-class softmax: 0 baby_cry, 1 siren, 2 fire_alarm, 3 other)
+// instead of the 521-class YAMNet. Flash the new model to the
+// same "yamnet" partition at 0x610000. mel_features.c is unchanged.
 #include <inttypes.h>
 #include <math.h>
 #include <new>
@@ -26,7 +30,7 @@ static constexpr int SAMPLE_RATE = 16000;
 static constexpr size_t kTensorArenaSize = 2 * 1024 * 1024;
 static constexpr size_t kI2sFramesPerRead = 160;
 static constexpr size_t kI2sWordsPerRead = kI2sFramesPerRead * 2;
-static constexpr int kClassCount = 521;
+static constexpr int kClassCount = 4;
 static constexpr int kTopCount = 5;
 
 /* VIBRATION_INTEGRATION_V1 */
@@ -34,16 +38,12 @@ static constexpr gpio_num_t kVibrationPin = GPIO_NUM_7;
 // FIXED (false-vibration): see process_alert_scores() for the full rules.
 // Only THREE wanted events may vibrate: baby cry, fire alarm, siren.
 // Telephone / doorbell / car alarm / generic loud sounds are NOT alerts.
-static constexpr float kBabyThreshold  = 0.55f;  // lower than siren: INT8 YAMNet under-scores
-                                                  // baby cry; the unknown-check + streak +
-                                                  // loudness gate carry the false-alarm defence.
-                                                  // MUST be field-tuned with a real cry recording.
-static constexpr float kSirenThreshold = 0.65f;
-static constexpr float kFireThreshold  = 0.60f;
+static constexpr float kModelThreshold = 0.80f;  // softmax prob for an alert class;
+                                                  // tune from training_report.txt
+                                                  // (false-alert table) after training.
 static constexpr float kReleaseThreshold = 0.35f;
 static constexpr int kRequiredDetections = 3;      // was 2 (~2 patches = ~1.9 s is too easy for a transient)
 static constexpr int kRequiredReleasePatches = 2; // was defined but never used
-static constexpr float kUnknownMargin = 0.05f;      // target must beat EVERY non-target class
 static constexpr float kMinPatchDbfs = -45.0f;      // loudness gate: quiet patches can never alert
 static constexpr float kMaxClipFraction = 0.02f;    // clipped/distorted patches can never alert
 
@@ -155,55 +155,12 @@ static bool initialize_vibration(void)
 }
 
 // ---------------------------------------------------------------------------
-// FIXED alert decision.
-//
-// WHY THE OLD CODE VIBRATED FOR UNKNOWN SOUNDS:
-//  1. It only compared 3 hand-picked groups against EACH OTHER (baby vs a
-//     7-class emergency max vs telephone). It never looked at the other
-//     ~512 classes. YAMNet is a scene classifier: for speech / music / TV /
-//     a kettle it still gives SOME score to baby/siren/alarm, and if that
-//     crossed 0.50-0.60 for 2 patches the motor fired -- even when the
-//     model's actual top class was Speech / Music / Vehicle at 0.90.
-//  2. Emergency was max() over 7 classes, so every patch got 7 chances to
-//     cross the threshold instead of 1.
-//  3. There was no loudness gate in this firmware at all: quiet room noise
-//     was classified and could alert. (RMS was logged, never used.)
-//  4. Baby had a special case that SKIPPED the margin check and let a
-//     competitor beat it by 0.12 and still alert as BABY_CRY.
-//  5. Telephone bell (384) was an alert at all -- not a wanted event.
-//  6. kReleaseThreshold / kRequiredReleasePatches were defined but unused:
-//     no re-arm condition, so one long sound re-alerted every 5 s cooldown.
-//
-// RULES NOW (all must pass, in this order):
-//  A. Patch must be loud enough (RMS gate) and not clipped.
-//  B. A wanted class must clear its own threshold.
-//  C. That wanted class must beat EVERY non-target class (unknown check) --
-//     if the best explanation of the sound is anything else, it is unknown
-//     and must not vibrate.
-//  D. Same wanted event in 3 consecutive patches (~2.9 s). Wanted events
-//     (cry / alarm / siren) are sustained; door slams, coughs, claps and
-//     beeps are not.
-//  E. Cooldown, then re-arm only after 2 quiet patches.
-// Thresholds are starting points: validate with the DECISION logs on the
-// real device (positive + negative tests) before trusting them.
+// CUSTOM-MODEL alert decision. The model is a 4-class softmax trained for
+// this device (0 baby_cry, 1 siren, 2 fire_alarm, 3 other):
+// probabilities sum to 1, so "other" winning IS the unknown
+// rejection — no 521-class scan needed. The loudness/clipping gates,
+// 3-patch streak, cooldown and re-arm rules from the YAMNet fix stay.
 // ---------------------------------------------------------------------------
-static bool is_target_family(int idx)
-{
-    // Wanted classes + their close AudioSet relatives. Relatives are not
-    // competitors: a real fire alarm also lights up "Alarm" (382), a real
-    // baby cry also lights up "Crying, sobbing" (19) / "Whimper" (21).
-    static constexpr int kFamily[] = {
-        19, 20, 21, 22,          // crying / baby cry / whimper / wail
-        304,                     // car alarm (siren family relative)
-        317, 318, 319,           // police / ambulance / fire-engine siren
-        382, 389,                // alarm / alarm clock (fire family relative)
-        390, 391,                // siren / civil-defense siren
-        393, 394,                // smoke detector / fire alarm
-    };
-    for (int f : kFamily) if (f == idx) return true;
-    return false;
-}
-
 static void process_alert_scores(const TfLiteTensor *output)
 {
     static int candidate_streak = 0;
@@ -212,83 +169,57 @@ static void process_alert_scores(const TfLiteTensor *output)
     static int64_t last_alert_us = 0;
     static AlertPattern previous_candidate = AlertPattern::Siren;
 
-    const float baby_score = class_score(output, 20);
-    float siren_score = 0.0f;
-    for (int idx : {317, 318, 319, 390, 391}) {
-        const float s = class_score(output, idx);
-        if (s > siren_score) siren_score = s;
-    }
-    float fire_score = 0.0f;
-    for (int idx : {393, 394}) {
-        const float s = class_score(output, idx);
-        if (s > fire_score) fire_score = s;
-    }
+    const float p_baby  = class_score(output, 0);
+    const float p_siren = class_score(output, 1);
+    const float p_fire  = class_score(output, 2);
+    const float p_other = class_score(output, 3);
 
-    // Best non-target ("unknown") class over all 521.
-    float unknown_score = 0.0f;
-    int unknown_index = -1;
-    for (int i = 0; i < kClassCount; ++i) {
-        if (is_target_family(i)) continue;
-        const float s = class_score(output, i);
-        if (s > unknown_score) { unknown_score = s; unknown_index = i; }
-    }
+    AlertPattern candidate = AlertPattern::BabyCry;
+    float best = p_baby;
+    if (p_siren > best) { best = p_siren; candidate = AlertPattern::Siren; }
+    if (p_fire  > best) { best = p_fire;  candidate = AlertPattern::FireAlarm; }
+    const char *name = candidate == AlertPattern::BabyCry ? "BABY_CRY" :
+                       candidate == AlertPattern::Siren ? "SIREN" :
+                       "FIRE_ALARM";
 
-    AlertPattern candidate = AlertPattern::Siren;
-    float best_score = siren_score;
-    float threshold = kSirenThreshold;
-    if (baby_score > best_score) { best_score = baby_score; candidate = AlertPattern::BabyCry; threshold = kBabyThreshold; }
-    if (fire_score > best_score)  { best_score = fire_score; candidate = AlertPattern::FireAlarm; threshold = kFireThreshold; }
-    const char *name = candidate == AlertPattern::Siren ? "SIREN" :
-                       candidate == AlertPattern::BabyCry ? "BABY_CRY" : "FIRE_ALARM";
-
-    // A. Loudness / clipping gate.
     if (s_last_patch_dbfs < kMinPatchDbfs) {
-        ESP_LOGI(TAG, "DECISION=REJECT reason=TOO_QUIET dbfs=%.1f min=%.1f baby=%.3f siren=%.3f fire=%.3f",
-                 s_last_patch_dbfs, kMinPatchDbfs, baby_score, siren_score, fire_score);
+        ESP_LOGI(TAG, "DECISION=REJECT reason=TOO_QUIET dbfs=%.1f baby=%.3f siren=%.3f fire=%.3f other=%.3f",
+                 s_last_patch_dbfs, p_baby, p_siren, p_fire, p_other);
         candidate_streak = 0;
         if (++release_streak >= kRequiredReleasePatches) armed = true;
         return;
     }
     if (s_last_clip_fraction > kMaxClipFraction) {
-        ESP_LOGI(TAG, "DECISION=REJECT reason=CLIPPED clip=%.3f baby=%.3f siren=%.3f fire=%.3f",
-                 s_last_clip_fraction, baby_score, siren_score, fire_score);
+        ESP_LOGI(TAG, "DECISION=REJECT reason=CLIPPED clip=%.3f baby=%.3f siren=%.3f fire=%.3f other=%.3f",
+                 s_last_clip_fraction, p_baby, p_siren, p_fire, p_other);
         candidate_streak = 0;
         return;
     }
-    // B. Per-event threshold.
-    if (best_score < threshold) {
-        ESP_LOGI(TAG, "DECISION=REJECT reason=LOW_SCORE baby=%.3f siren=%.3f fire=%.3f best=%s/%.3f threshold=%.2f unknown=%d/%.3f streak=0",
-                 baby_score, siren_score, fire_score, name, best_score, threshold, unknown_index, unknown_score);
+    if (best < kModelThreshold || p_other >= best) {
+        ESP_LOGI(TAG, "DECISION=REJECT reason=%s baby=%.3f siren=%.3f fire=%.3f other=%.3f best=%s/%.3f threshold=%.2f streak=0",
+                 p_other >= best ? "OTHER_WINS" : "LOW_SCORE",
+                 p_baby, p_siren, p_fire, p_other, name, best, kModelThreshold);
         candidate_streak = 0;
         if (++release_streak >= kRequiredReleasePatches) armed = true;
         return;
     }
-    // C. Unknown check: a non-target class explains this sound better.
-    if (unknown_score > best_score + kUnknownMargin) {
-        ESP_LOGI(TAG, "DECISION=REJECT reason=UNKNOWN top_non_target=%d/%.3f best_target=%s/%.3f baby=%.3f siren=%.3f fire=%.3f",
-                 unknown_index, unknown_score, name, best_score, baby_score, siren_score, fire_score);
-        candidate_streak = 0;
-        return;
-    }
     release_streak = 0;
     if (!armed) {
-        ESP_LOGI(TAG, "DECISION=REJECT reason=NOT_REARMED candidate=%s score=%.3f", name, best_score);
+        ESP_LOGI(TAG, "DECISION=REJECT reason=NOT_REARMED candidate=%s score=%.3f", name, best);
         return;
     }
-    // D. Temporal confirmation: 3 consecutive patches, same event.
     if (candidate_streak == 0 || candidate != previous_candidate) {
         previous_candidate = candidate;
         candidate_streak = 1;
-        ESP_LOGI(TAG, "DECISION=WAIT reason=FIRST_WIN baby=%.3f siren=%.3f fire=%.3f candidate=%s score=%.3f streak=1/%d",
-                 baby_score, siren_score, fire_score, name, best_score, kRequiredDetections);
+        ESP_LOGI(TAG, "DECISION=WAIT reason=FIRST_WIN candidate=%s score=%.3f other=%.3f streak=1/%d",
+                 name, best, p_other, kRequiredDetections);
         return;
     }
     if (++candidate_streak < kRequiredDetections) {
         ESP_LOGI(TAG, "DECISION=WAIT reason=STREAK candidate=%s score=%.3f streak=%d/%d",
-                 name, best_score, candidate_streak, kRequiredDetections);
+                 name, best, candidate_streak, kRequiredDetections);
         return;
     }
-    // E. Cooldown.
     constexpr int64_t kCooldownUs = 8000000LL;
     const int64_t now_us = esp_timer_get_time();
     if (now_us - last_alert_us < kCooldownUs) {
@@ -298,10 +229,10 @@ static void process_alert_scores(const TfLiteTensor *output)
         return;
     }
     if (xQueueSend(s_alert_queue, &candidate, 0) == pdTRUE) {
-        ESP_LOGW(TAG, "DECISION=ALERT pattern=%s baby=%.3f siren=%.3f fire=%.3f unknown=%d/%.3f dbfs=%.1f",
-                 name, baby_score, siren_score, fire_score, unknown_index, unknown_score, s_last_patch_dbfs);
+        ESP_LOGW(TAG, "DECISION=ALERT pattern=%s baby=%.3f siren=%.3f fire=%.3f other=%.3f dbfs=%.1f",
+                 name, p_baby, p_siren, p_fire, p_other, s_last_patch_dbfs);
         last_alert_us = now_us;
-        armed = false;          // must see quiet patches before re-alerting
+        armed = false;
         release_streak = 0;
     } else {
         ESP_LOGW(TAG, "DECISION=REJECT reason=VIBRATION_QUEUE_BUSY candidate=%s", name);
@@ -312,7 +243,7 @@ static void process_alert_scores(const TfLiteTensor *output)
 static uint8_t *tensor_arena = nullptr;
 static void *interpreter_mem = nullptr;
 static tflite::MicroInterpreter *interpreter = nullptr;
-static tflite::MicroMutableOpResolver<6> resolver;
+static tflite::MicroMutableOpResolver<10> resolver;
 static const void *model_data = nullptr;
 static esp_partition_mmap_handle_t model_handle = 0;
 
@@ -412,7 +343,9 @@ static bool initialize_model()
         resolver.AddDepthwiseConv2D() != kTfLiteOk ||
         resolver.AddMean() != kTfLiteOk ||
         resolver.AddFullyConnected() != kTfLiteOk ||
-        resolver.AddLogistic() != kTfLiteOk) {
+        resolver.AddQuantize() != kTfLiteOk ||
+        resolver.AddDequantize() != kTfLiteOk ||
+        resolver.AddSoftmax() != kTfLiteOk) {
         ESP_LOGE(TAG, "TFLite operator registration failed");
         return false;
     }
@@ -442,9 +375,12 @@ static bool initialize_model()
     TfLiteTensor *output = interpreter->output(0);
     if (input == nullptr || output == nullptr ||
         input->type != kTfLiteInt8 || output->type != kTfLiteInt8 ||
-        input->dims->size != 3 || input->dims->data[0] != 1 ||
-        input->dims->data[1] != MEL_FRAMES_PATCH ||
-        input->dims->data[2] != MEL_BANDS ||
+        !((input->dims->size == 3 && input->dims->data[0] == 1 &&
+           input->dims->data[1] == MEL_FRAMES_PATCH &&
+           input->dims->data[2] == MEL_BANDS) ||
+          (input->dims->size == 4 && input->dims->data[0] == 1 &&
+           input->dims->data[1] == MEL_FRAMES_PATCH &&
+           input->dims->data[2] == MEL_BANDS && input->dims->data[3] == 1)) ||
         output->dims->size != 2 || output->dims->data[0] != 1 ||
         output->dims->data[1] != kClassCount || input->params.scale <= 0.0f ||
         output->params.scale <= 0.0f) {
@@ -513,25 +449,11 @@ static bool initialize_microphone(i2s_chan_handle_t *rx_handle)
 
 static void report_scores(const TfLiteTensor *output, int64_t elapsed_us)
 {
-    float emergency_score = 0.0f;
-
-    const int emergency_classes[] = {
-        317, 318, 319, 390, 391, 393, 394
-    };
-
-    for (int i = 0; i < 7; ++i) {
-        const float score = class_score(output, emergency_classes[i]);
-
-        if (score > emergency_score) {
-            emergency_score = score;
-        }
-    }
-
     ESP_LOGI(TAG,
-             "Inference: %.1f ms | Baby cry: %.3f | Emergency(siren+fire): %.3f",
+             "Inference: %.1f ms | baby %.3f | siren %.3f | fire %.3f | other %.3f",
              elapsed_us / 1000.0,
-             class_score(output, 20),
-             emergency_score);
+             class_score(output, 0), class_score(output, 1),
+             class_score(output, 2), class_score(output, 3));
 }
 
 static void inference_task(void *arg)
