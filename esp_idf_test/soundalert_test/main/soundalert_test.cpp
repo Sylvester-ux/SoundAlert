@@ -38,11 +38,14 @@ static constexpr gpio_num_t kVibrationPin = GPIO_NUM_7;
 // FIXED (false-vibration): see process_alert_scores() for the full rules.
 // Only THREE wanted events may vibrate: baby cry, fire alarm, siren.
 // Telephone / doorbell / car alarm / generic loud sounds are NOT alerts.
-static constexpr float kModelThreshold = 0.80f;  // softmax prob for an alert class;
-                                                  // tune from training_report.txt
-                                                  // (false-alert table) after training.
+static constexpr float kModelThreshold = 0.70f;  // TUNED 2026-10-22 (Dennis): was 0.80.
+                                                  // A patch is a "win" for a class at >=
+                                                  // this score, if it also beats "other".
 static constexpr float kReleaseThreshold = 0.35f;
-static constexpr int kRequiredDetections = 3;      // was 2 (~2 patches = ~1.9 s is too easy for a transient)
+static constexpr int kWindowPatches = 3;           // TUNED 2026-10-22: sliding window over the
+static constexpr int kRequiredWins = 2;            // last 3 patches; 2 wins for the SAME class
+                                                  // inside the window trigger an alert
+                                                  // (was: 3 consecutive patches at 0.80).
 static constexpr int kRequiredReleasePatches = 2; // was defined but never used
 static constexpr float kMinPatchDbfs = -45.0f;      // loudness gate: quiet patches can never alert
 static constexpr float kMaxClipFraction = 0.02f;    // clipped/distorted patches can never alert
@@ -159,15 +162,48 @@ static bool initialize_vibration(void)
 // this device (0 baby_cry, 1 siren, 2 fire_alarm, 3 other):
 // probabilities sum to 1, so "other" winning IS the unknown
 // rejection — no 521-class scan needed. The loudness/clipping gates,
-// 3-patch streak, cooldown and re-arm rules from the YAMNet fix stay.
+// cooldown and re-arm rules from the YAMNet fix stay; the streak rule
+// is now a 2-wins-in-any-3-patches window at a 0.70 win threshold
+// (tuned 2026-10-22).
 // ---------------------------------------------------------------------------
+// Sliding win window: the outcome of each of the last kWindowPatches
+// evaluated patches — a model class index (0 baby, 1 siren, 2 fire) for
+// a win, or -1 for any non-win (below threshold, "other" won, gated).
+static int8_t s_win_history[kWindowPatches] = {-1, -1, -1};
+static int s_win_history_len = 0;
+
+static void window_push(int8_t outcome)
+{
+    if (s_win_history_len < kWindowPatches) {
+        s_win_history[s_win_history_len++] = outcome;
+        return;
+    }
+    for (int i = 0; i + 1 < kWindowPatches; ++i) {
+        s_win_history[i] = s_win_history[i + 1];
+    }
+    s_win_history[kWindowPatches - 1] = outcome;
+}
+
+static int window_wins_for(int8_t cls)
+{
+    int wins = 0;
+    for (int i = 0; i < s_win_history_len; ++i) {
+        if (s_win_history[i] == cls) ++wins;
+    }
+    return wins;
+}
+
+static void window_clear()
+{
+    s_win_history_len = 0;
+    for (int i = 0; i < kWindowPatches; ++i) s_win_history[i] = -1;
+}
+
 static void process_alert_scores(const TfLiteTensor *output)
 {
-    static int candidate_streak = 0;
     static int release_streak = 0;
     static bool armed = true;
     static int64_t last_alert_us = 0;
-    static AlertPattern previous_candidate = AlertPattern::Siren;
 
     const float p_baby  = class_score(output, 0);
     const float p_siren = class_score(output, 1);
@@ -181,25 +217,28 @@ static void process_alert_scores(const TfLiteTensor *output)
     const char *name = candidate == AlertPattern::BabyCry ? "BABY_CRY" :
                        candidate == AlertPattern::Siren ? "SIREN" :
                        "FIRE_ALARM";
+    const int8_t candidate_index = candidate == AlertPattern::BabyCry ? 0 :
+                                   candidate == AlertPattern::Siren ? 1 : 2;
 
     if (s_last_patch_dbfs < kMinPatchDbfs) {
         ESP_LOGI(TAG, "DECISION=REJECT reason=TOO_QUIET dbfs=%.1f baby=%.3f siren=%.3f fire=%.3f other=%.3f",
                  s_last_patch_dbfs, p_baby, p_siren, p_fire, p_other);
-        candidate_streak = 0;
+        window_push(-1);
         if (++release_streak >= kRequiredReleasePatches) armed = true;
         return;
     }
     if (s_last_clip_fraction > kMaxClipFraction) {
         ESP_LOGI(TAG, "DECISION=REJECT reason=CLIPPED clip=%.3f baby=%.3f siren=%.3f fire=%.3f other=%.3f",
                  s_last_clip_fraction, p_baby, p_siren, p_fire, p_other);
-        candidate_streak = 0;
+        window_push(-1);
         return;
     }
     if (best < kModelThreshold || p_other >= best) {
-        ESP_LOGI(TAG, "DECISION=REJECT reason=%s baby=%.3f siren=%.3f fire=%.3f other=%.3f best=%s/%.3f threshold=%.2f streak=0",
+        ESP_LOGI(TAG, "DECISION=REJECT reason=%s baby=%.3f siren=%.3f fire=%.3f other=%.3f best=%s/%.3f threshold=%.2f wins=%d/%d",
                  p_other >= best ? "OTHER_WINS" : "LOW_SCORE",
-                 p_baby, p_siren, p_fire, p_other, name, best, kModelThreshold);
-        candidate_streak = 0;
+                 p_baby, p_siren, p_fire, p_other, name, best, kModelThreshold,
+                 window_wins_for(candidate_index), kRequiredWins);
+        window_push(-1);
         if (++release_streak >= kRequiredReleasePatches) armed = true;
         return;
     }
@@ -208,16 +247,11 @@ static void process_alert_scores(const TfLiteTensor *output)
         ESP_LOGI(TAG, "DECISION=REJECT reason=NOT_REARMED candidate=%s score=%.3f", name, best);
         return;
     }
-    if (candidate_streak == 0 || candidate != previous_candidate) {
-        previous_candidate = candidate;
-        candidate_streak = 1;
-        ESP_LOGI(TAG, "DECISION=WAIT reason=FIRST_WIN candidate=%s score=%.3f other=%.3f streak=1/%d",
-                 name, best, p_other, kRequiredDetections);
-        return;
-    }
-    if (++candidate_streak < kRequiredDetections) {
-        ESP_LOGI(TAG, "DECISION=WAIT reason=STREAK candidate=%s score=%.3f streak=%d/%d",
-                 name, best, candidate_streak, kRequiredDetections);
+    window_push(candidate_index);
+    const int wins = window_wins_for(candidate_index);
+    if (wins < kRequiredWins) {
+        ESP_LOGI(TAG, "DECISION=WAIT reason=WINDOW candidate=%s score=%.3f other=%.3f wins=%d/%d",
+                 name, best, p_other, wins, kRequiredWins);
         return;
     }
     constexpr int64_t kCooldownUs = 8000000LL;
@@ -225,7 +259,7 @@ static void process_alert_scores(const TfLiteTensor *output)
     if (now_us - last_alert_us < kCooldownUs) {
         ESP_LOGI(TAG, "DECISION=REJECT reason=COOLDOWN candidate=%s remaining_ms=%" PRId64,
                  name, (kCooldownUs - (now_us - last_alert_us)) / 1000);
-        candidate_streak = 0;
+        window_clear();
         return;
     }
     if (xQueueSend(s_alert_queue, &candidate, 0) == pdTRUE) {
@@ -237,7 +271,7 @@ static void process_alert_scores(const TfLiteTensor *output)
     } else {
         ESP_LOGW(TAG, "DECISION=REJECT reason=VIBRATION_QUEUE_BUSY candidate=%s", name);
     }
-    candidate_streak = 0;
+    window_clear();
 }
 
 static uint8_t *tensor_arena = nullptr;
